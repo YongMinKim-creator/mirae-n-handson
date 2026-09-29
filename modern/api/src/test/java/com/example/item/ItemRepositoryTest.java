@@ -11,6 +11,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.test.context.ActiveProfiles;
 
 /** 저장소 슬라이스 — H2(MariaDB 모드)에 실제 SQL 을 날린다. */
@@ -79,5 +81,75 @@ class ItemRepositoryTest {
         assertThat(itemRepository.countByUnitIdAndStatus(fraction.getId(), ItemStatus.ACTIVE)).isEqualTo(3);
         assertThat(itemRepository.countByUnitIdAndStatus(fraction.getId(), ItemStatus.DELETED)).isEqualTo(1);
         assertThat(unitRepository.findByCode("M5-3")).isPresent();
+    }
+
+    private Page<Item> search(String query, int pageSize) {
+        ItemSearchCondition condition = ItemSearchCondition.from(ItemSearchParams.fromQueryString(query));
+        return itemRepository.findAll(ItemSpecifications.matching(condition),
+            PageRequest.of(condition.page() - 1, pageSize, condition.sort().toSort(condition.dir())));
+    }
+
+    @Test
+    @DisplayName("검색 기본: 공개만 · 난이도 5 제외 · 난이도 내림차순 · 전체 건수")
+    void searchDefaultExcludesLevelMaxAndInactive() {
+        Page<Item> page = search(null, ItemSearchCondition.PAGE_SIZE);
+
+        assertThat(page.getContent()).extracting(Item::getTitle)
+            .containsExactly("분수 문장제", "분모가 같은 분수의 덧셈", "소수 곱셈");
+        assertThat(page.getTotalElements()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("검색: 난이도 5 를 직접 주면 조회되고, 태그는 이름 정확 일치로 AND 결합")
+    void searchByExplicitLevelAndTag() {
+        assertThat(search("level=5&tag=%EB%AC%B8%EC%9E%A5%EC%A0%9C", ItemSearchCondition.PAGE_SIZE).getContent())
+            .extracting(Item::getTitle).containsExactly("난이도 5 분수");
+        assertThat(search("tag=%EB%AC%B8%EC%9E%A5", ItemSearchCondition.PAGE_SIZE).getTotalElements()).isZero();
+        // 페이지 크기 1 로 COUNT 쿼리를 따로 타게 해 태그 EXISTS 가 건수 쿼리에서도 도는지 본다
+        assertThat(search("tag=%EB%AC%B8%EC%9E%A5%EC%A0%9C", 1).getTotalElements()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("검색: 없는 단원 · 이상한 난이도 · 범위 밖 난이도는 예외 없이 0건")
+    void searchWithUnknownValuesReturnsZero() {
+        assertThat(search("unit=Z9-99", ItemSearchCondition.PAGE_SIZE).getTotalElements()).isZero();
+        assertThat(search("level=abc", ItemSearchCondition.PAGE_SIZE).getTotalElements()).isZero();
+        assertThat(search("level=99999999999999999999", ItemSearchCondition.PAGE_SIZE).getTotalElements()).isZero();
+    }
+
+    @Test
+    @DisplayName("검색: 키워드는 지문에도 걸리고, 단원 정렬 desc 여도 단원 안은 난이도 내림차순")
+    void searchByKeywordInStemSortedByUnit() {
+        assertThat(search("q=%EB%B3%B8%EB%AC%B8&sort=unit&dir=desc", ItemSearchCondition.PAGE_SIZE).getContent())
+            .extracting(Item::getTitle)
+            .containsExactly("소수 곱셈", "분수 문장제", "분모가 같은 분수의 덧셈");
+    }
+
+    @Test
+    @DisplayName("검색: 페이지를 넘기면 다음 행과 전체 건수, 범위 밖 페이지는 빈 목록에 건수 유지")
+    void searchPagesInDatabase() {
+        Page<Item> second = search("page=2", 2);
+        assertThat(second.getContent()).extracting(Item::getTitle).containsExactly("소수 곱셈");
+        assertThat(second.getTotalElements()).isEqualTo(3);
+
+        Page<Item> beyond = search("page=5", 2);
+        assertThat(beyond.getContent()).isEmpty();
+        assertThat(beyond.getTotalElements()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("findWithDetailsByIdIn: 여러 건을 단원 · 태그와 함께 로드")
+    void findWithDetailsByIdInLoadsTags() {
+        List<Integer> ids = search(null, ItemSearchCondition.PAGE_SIZE).getContent().stream()
+            .map(Item::getId).toList();
+        entityManager.clear();
+
+        List<Item> items = itemRepository.findWithDetailsByIdIn(ids);
+
+        assertThat(items).hasSize(3);
+        assertThat(items).allSatisfy(item -> {
+            assertThat(Hibernate.isInitialized(item.getUnit())).isTrue();
+            assertThat(Hibernate.isInitialized(item.getTags())).isTrue();
+        });
     }
 }
