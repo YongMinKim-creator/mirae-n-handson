@@ -1,5 +1,13 @@
 # a-connection-pool 장애 원인 분석 (RCA)
 
+## 요약
+
+- **언제**: 2026-09-16 (KST) 징후 14:37:42, 사용자 영향 14:40:52 ~ 14:51:47(약 11분). 5xx 186건(500 49 · 502 82 · 504 55). 이후 재발 없음(15:29 까지 5xx 0건).
+- **무엇**: `GET /api/classes/{id}/report` 가 DB 연결을 오래 쥐어 풀(5개)이 고갈됐고, 그 때문에 `/api/units/**` 등 다른 API 가 3초 안에 연결을 못 얻어 500, nginx 가 502 · 504 로 번졌다.
+- **원인**: `ReportService.buildClassReport` 가 `@Transactional` 안에서 DB 조회가 끝난 뒤에도 서명(`sign`, SHA-256 20만 회)을 돌며 연결을 쥐고, 14:38 부터 보고서 요청이 평소의 수십 배로 몰렸다.
+- **확신**: **중간.** 연결 보유 구조는 코드 · 로그가 일치(높음). 보유 시간이 15~21초까지 늘어난 이유와 요청 폭증의 원인은 확인하지 못했다(9절).
+- **상태**: 코드 · 설정은 수정하지 않았다. 제안은 6~8절.
+
 ## 1. 수집 범위
 
 - 대상: `incident-logs/a-connection-pool/` 의 로그 4개 (2026-09-16 하루치)
@@ -12,7 +20,7 @@
 |---|---:|---|---|---|---|
 | `app.log` | 5,371 | 09-16 06:43:56.753 ~ 15:29:51.760 | `2026-09-16T06:43:56.753+09:00` (ISO-8601, ms) | **KST** (`+09:00` 명시) | 줄 자체에 오프셋이 있음 |
 | `nginx-access.log` | 21,086 | 09-16 06:43:56 ~ 15:29:59 | `[16/Sep/2026:06:43:56 +0900]` (CLF) | **KST** (`+0900` 명시) | 줄 자체에 오프셋이 있음 |
-| `nginx-error.log` | 168 | 09-16 09:12:03 ~ 14:51:47 | `2026/09/16 09:12:03` | **KST 로 판단** (표기 없음) | 14:41:06 `upstream timed out` 이 access.log 의 같은 초 · 같은 클라이언트(`10.20.3.12`) · 같은 URL 의 504 와 일치 (access.log:18933) |
+| `nginx-error.log` | 168 | 09-16 09:12:03 ~ 14:51:47 | `2026/09/16 09:12:03` | **KST 로 판단** (표기 없음) | 14:41:06 `upstream timed out` 이 access.log 의 같은 초 · 같은 클라이언트(`교사단말A`) · 같은 URL 의 504 와 일치 (access.log:18933) |
 | `mariadb-slow.log` | 21 (쿼리 3건) | 09-16 09:14:07 ~ 14:37:52 | 헤더 `# Time: 260916  0:14:09` (`yyMMdd H:mm:ss`, 0 패딩 없음) + `SET timestamp=<epoch>` | **UTC** (표기 없음) | `SET timestamp=1789517647` = 00:14:07 UTC = 09:14:07 KST. 3건 모두 동일하게 +9시간 |
 
 ### 1.2 KST 기준 변환 규칙
@@ -206,7 +214,7 @@
 | 1. 가설 | 특정 클라이언트(화면 폴링 · 자동 새로고침 · 504 후 재시도)가 보고서를 14:38 부터 자주 호출해, 총 요청량은 같은데 무거운 요청의 비중이 늘어 풀 용량을 넘겼다. |  |
 | 2. 지지 근거 | ① 보고서 요청이 14:07~14:37 분당 ≤1건 → 14:38 3건 → 14:40 이후 10~19건(`:129`, `:131`). ② 전체 요청수는 분당 34~58건으로 같은 범위(`:131`, `:157`) — 변한 것은 보고서 비중뿐. ③ 504 가 보고서에만 55건(`:135`). 504 후 재요청이 있었다면 증폭 가능(미확인). ④ 보고서 요청이 정상화(분당 ≤2건)된 뒤 leak WARN 이 사라짐(`:149`). |  |
 | 3. 반증 조건 | ⓐ 14:38~14:51 보고서 요청이 소수 클라이언트가 아니라 평소와 같은 클라이언트 분포 · 같은 간격이다(요청량 증가가 아니라 요청 하나의 처리 시간이 길어진 것). ⓑ 504 직후 같은 클라이언트의 재요청이 없다. ⓒ 평소(13:00~13:30)에도 보고서 요청이 분당 10건 이상인 시간대가 있는데 그때는 장애가 없었다. | ⓐ **해당 없음(반증 안 됨)** — 보고서 호출 IP 는 하루 종일 같은 4개이지만 호출 수가 5건 → 171건으로 늘었다. 평소와 같은 간격이 아니다. ⓑ **해당 없음** — 504 55건 중 53건이 같은 IP · 같은 URL 로 재요청됐고 52건이 60초 안(간격 중앙값 19초)이다. ⓒ **해당 없음** — 평소 시간당 최대 11건(10시 · 12시)이라 분당 10건 이상은 이 장애 구간뿐이다. |
-| 4. 확인 방법 | `awk '/\/api\/classes\/[0-9]+\/report/ {print $1}' incident-logs/a-connection-pool/nginx-access.log \| sort \| uniq -c \| sort -rn \| head` (클라이언트 IP별 호출 수; 시간대는 `grep '16/Sep/2026:14:'` 로 좁혀 반복) / 같은 IP · URL 의 504 직후 재요청 간격 확인(`grep -n '10.20.3.12' …`) / 13:00~13:30 · 14:07~14:37 의 분당 보고서 호출 수와 비교 | 3.7절 H3-①~③. 증가는 첫 504(14:41:06) 이전에 시작했다(14:38~14:41:05 에 18건). 즉 재시도는 증폭 요인일 수 있어도 증가의 시작 원인은 아니다. User-Agent 는 브라우저 2종이라 자동화 도구 호출 흔적은 없다. |
+| 4. 확인 방법 | `awk '/\/api\/classes\/[0-9]+\/report/ {print $1}' incident-logs/a-connection-pool/nginx-access.log \| sort \| uniq -c \| sort -rn \| head` (클라이언트 IP별 호출 수; 시간대는 `grep '16/Sep/2026:14:'` 로 좁혀 반복) / 같은 IP · URL 의 504 직후 재요청 간격 확인(`grep -n '<교사단말A 의 IP>' …`) / 13:00~13:30 · 14:07~14:37 의 분당 보고서 호출 수와 비교 | 3.7절 H3-①~③. 증가는 첫 504(14:41:06) 이전에 시작했다(14:38~14:41:05 에 18건). 즉 재시도는 증폭 요인일 수 있어도 증가의 시작 원인은 아니다. User-Agent 는 브라우저 2종이라 자동화 도구 호출 흔적은 없다. |
 
 ### 3.5 H4 — 배포 · 설정 (풀 설정 · 코드 변경)
 
@@ -276,9 +284,9 @@ db/mariadb/init/01-schema.sql:113:  KEY idx_submission_student (student_id),
 **H3-①** 보고서 요청 IP (이상 구간 14:38~14:51 / 평소 14:07~14:37)
 
 ```
-이상 구간: 10.20.3.11=67  10.20.3.12=40  10.20.3.17=35  10.20.3.23=29   (합계 171)
-평소    : 10.20.3.12=3    10.20.3.17=1    10.20.3.11=1                   (합계 5)
-하루 전체: 10.20.3.11=87  10.20.3.12=57  10.20.3.17=56  10.20.3.23=29
+이상 구간: 교사단말B=67  교사단말A=40  교사단말C=35  교사단말D=29   (합계 171)
+평소    : 교사단말A=3    교사단말C=1    교사단말B=1                   (합계 5)
+하루 전체: 교사단말B=87  교사단말A=57  교사단말C=56  교사단말D=29
 classId : /api/classes/1/report=64  /api/classes/2/report=32  /api/classes/3/report=75   (합계 171, 요청 경로 필드 `$7` 만 집계)
 ```
 
@@ -296,7 +304,7 @@ gap min 1.0  median 19.0  max 448.0  <=60s: 52
 
 ```
 14:38~14:41:05 (첫 504 이전) 보고서 요청: 18건
-첫 요청: 10.20.3.12 14:38:01, :27, :57, 14:39:24, :55 (class 3, 27~33초 간격)
+첫 요청: 교사단말A 14:38:01, :27, :57, 14:39:24, :55 (class 3, 27~33초 간격)
 User-Agent(이상 구간 보고서): Firefox/130 Windows=102, Safari/17.6 macOS=69
 Referer 예: https://lms.example.com/teacher/classes/3/report
 ```
@@ -362,3 +370,95 @@ $ git log --format='%h %ad %s' --date=iso -- modern/api/src/main/resources/appli
 - `Rows_examined = 1,284,310` 의 실행 계획: 운영 DB 의 `EXPLAIN` 과 실제 인덱스 목록이 필요하다.
 - 14:38 에 보고서 호출이 늘어난 이유: 프런트(`lms.example.com`) 쪽 호출 로직과 업무 일정이 필요하다.
 - 이 장애가 수정 대상인지, 어떻게 고칠지(예: 서명을 트랜잭션 밖으로 이동)는 이 문서의 범위가 아니다. 코드는 수정하지 않았다.
+
+## 4. 원인
+
+채택 가설은 H1(3.8.2)이다. 인과 순서로 쓴다.
+
+**직접 원인** — 보고서 요청 한 건이 연결을 DB 작업보다 훨씬 오래 쥔다.
+
+1. `buildClassReport` 는 메서드 전체가 하나의 `@Transactional` 이라 호출 시작 시점에 연결을 얻고 반환 시점에 돌려준다(`open-in-view: false`).
+2. 안에서 DB 조회(학급 · 배포 · 배포별 제출물)를 끝낸 뒤 `sign()` 을 SHA-256 20만 회 반복으로 돌린다. 이 동안 DB 는 쓰지 않는데 연결은 잡혀 있다.
+3. 요청 한 건의 보유 시간은 장애 구간에서 약 15.5~21.5초(10초 임계 + 반환까지 5.5~11.5초)였다.
+4. 14:38 부터 보고서 요청이 분당 10~19건(평소 ≤1건)으로 늘었다. 보유 시간 약 19초 × 분당 10~19건 ≈ 동시 3~6개 연결(추정)로 풀 5개와 같은 크기다.
+5. 풀이 보고서 요청에 거의 점유되자 다른 요청이 `connection-timeout` 3초 안에 연결을 못 얻어 500 이 났고(14:40:52), nginx 가 upstream 실패를 502 · 504 로 바꿨다. 가장 많이 보인 `Connection is not available` 은 이 결과(증상)다.
+
+**배경 원인** — 직접 원인이 장애까지 이어지게 한 조건.
+
+- 코드에 같은 문제가 TODO 로 남아 있었다("커넥션(트랜잭션)을 쥔 채로 돈다"). 평소 요청률에서는 보유가 10초 미만이라 드러나지 않았다(14:07~14:37 보고서 6건, leak WARN 0건).
+- 풀 5개 · 대기 3초는 의도된 값이라 여유가 작다(`application.yml:11-15`). 이 값이 잘못이 아니라 문제를 빨리 드러냈다.
+- 보고서 호출에 캐시 · 호출 제한 · 재시도 억제가 없다(`grep` 0건). 504 55건 중 53건이 같은 IP · URL 로 재요청돼 부하를 키웠을 수 있다(증폭 요인, 시작 원인은 아님: 증가는 첫 504 이전에 시작).
+- 기여 요인: 첫 요청(14:37:42)은 같은 요청 안에서 9.81초 slow 쿼리(`distribution_id=5`)를 실행했다. 이후 133건은 slow 로그가 없어 이것으로 설명되지 않는다.
+- 트리거(14:38 호출 급증의 원인)와 14:37 이전 경보 체계는 로그로 확인하지 못했다.
+
+## 5. 근거 로그 줄
+
+경로: `a-connection-pool/` 아래 `app.log`(app) · `nginx-access.log`(access) · `nginx-error.log`(error) · `mariadb-slow.log`(slow). 코드는 `RS` = `modern/api/src/main/java/com/example/assignment/ReportService.java`, `YML` = `modern/api/src/main/resources/application.yml`.
+
+| 원인 서술 | 근거 (파일:줄) | 발췌 |
+|---|---|---|
+| 보고서 트랜잭션이 연결을 얻었다 | app:1252-1253 | `TransactionInterceptor.invoke` → `ReportService$$SpringCGLIB$$0.buildClassReport` |
+| 메서드 전체가 한 트랜잭션이다 | `RS:41` | `@Transactional public ClassReport buildClassReport(Integer classId)` |
+| DB 조회 뒤에도 연결을 쥔 채 서명한다 | `RS:69-71` | `// 커넥션(트랜잭션)을 쥔 채로 돈다` · `String signature = sign(payload.toString());` |
+| 서명이 20만 회 반복이다 | `RS:23`, `RS:88` | `SIGNATURE_ROUNDS = 200_000` · `for (int round = 0; …)` |
+| 10초 넘게 쥐어 leak WARN 이 났다(첫 건) | app:1243 | `Connection leak detection triggered for org.mariadb.jdbc.Connection@6e8f14d3` (14:37:52.199) |
+| leak 임계값이 10초다 | `YML:18` | `leak-detection-threshold: 10000` |
+| 보고서 응답이 끝나자 연결이 반환됐다 | app:1258-1259 | `built class report for class 3 …` → `Previously reported leaked connection … returned to the pool` (14:38:01.9) |
+| 첫 요청에 9.8초 slow 쿼리가 있었다 | slow:18,20,21 | `Query_time: 9.812417 … Rows_examined: 1284310` · `SET timestamp=1789537062`(=14:37:42 KST) · `where s1_0.distribution_id=5` |
+| 14:38 부터 보고서 호출이 늘었다 | access:18801 | `GET /api/classes/3/report HTTP/1.1" 200 266` (14:38:01, 이후 분당 10~19건: `a-connection-pool.md:131`) |
+| 풀 5개가 모두 점유돼 다른 API 가 실패했다 | app:1522-1523 | `itembank-pool - Connection is not available, request timed out after 3000ms (total=5, activ…` · `unhandled exception on /api/units/M6-2/items` (14:40:52) |
+| 대기 3초 · 풀 5 는 설정값이다 | `YML:14-15` | `maximum-pool-size: 5` · `connection-timeout: 3000` |
+| 사용자에게 500 이 갔다(첫 5xx) | access:18918 | `GET /api/units/M6-2/items HTTP/1.1" 500 162` (14:40:52) |
+| nginx 가 upstream 실패를 번역했다 | access:18933 · error:6, 10-12 | `504` · `upstream timed out (110: …)` (14:41:06) · `upstream server temporarily disabled` · `connect() failed (111: Connection refused)` · `no live upstreams` (14:42:01~04) |
+| 요청이 줄자 풀이 회복했다 | app:5251 · app:5267 · access:19381 | 마지막 leak WARN 14:51:37 · 마지막 `returned to the pool` 14:51:49 · 마지막 5xx 504 14:51:47. 14:59 보고서 분당 ≤2건 |
+| 평소 보유는 10초 미만이었다 | 3.7 H1-② | 14:05~14:37 보고서 6건, leak WARN 0건 |
+| 보유 시간 15.5~21.5초 | 3.7 H1-③ | 연결 객체별 leak WARN → 반환 간격 min 5.5 · median 8.9 · max 11.5초(+10초) |
+
+## 6. 수정안 (지금 적용할 것 — 제안만, 코드는 수정하지 않음)
+
+1. **`ReportService.java` — 서명을 트랜잭션 밖으로** (`RS:41-71`).
+   - 조회 · 집계(`RS:43-67`)만 읽기 전용 트랜잭션으로 묶고, `sign()`(`RS:71`)은 트랜잭션이 끝난 뒤 호출한다. 서명은 `payload` 만으로 결정되므로(`RS:85-93`) 응답은 바뀌지 않는다.
+   - 같은 클래스 안에서 메서드만 나누면 프록시를 거치지 않아 트랜잭션이 적용되지 않는다. 방법은 둘 중 하나: ① 조회 · 집계를 별도 `@Service`(예: `ReportQueryService`, 클래스에 `@Transactional(readOnly = true)`)로 옮기고 `buildClassReport` 에서 `@Transactional` 제거, ② `TransactionTemplate`(spring-tx 포함, 의존성 추가 없음)으로 조회 구간만 감싼다. CLAUDE.md 의 "조회 서비스는 `@Transactional(readOnly = true)`" 와 맞는 쪽은 ①이다.
+   - 새 public 서비스 메서드가 생기면 테스트 1개 이상이 필요하다. `ReportServiceTest.java:63` 의 서명 값 단언은 그대로 유지한다.
+   - 완료 기준: 이관 · 리팩토링 작업이므로 `characterization/` 의 `npm test` 전부 통과가 필요하다(이번에는 실행하지 않음).
+2. **`application.yml` — 변경 없음.** 풀 크기 · `connection-timeout` 을 키우지 않는다. 풀 설정은 변경 금지(CLAUDE.md 3절)이고, 키워도 연결을 20초 쥐는 구조는 그대로라 고갈 시점만 늦춘다.
+3. **임시 완화(저장소 밖, 운영 담당 요청)**: 코드 배포 전까지 nginx 에서 `/api/classes/*/report` 동시 요청 수 제한. nginx 설정은 이 저장소에 없다.
+
+## 7. 재발 방지 (구조적 장치)
+
+- **트랜잭션 범위 규칙**: CLAUDE.md 3절의 "`@Transactional` 안에서 외부 HTTP 금지" 를 "DB 외 작업(외부 호출 · CPU 집약 · 긴 루프) 금지" 로 넓히는 것을 제안한다. 코드로 판정 가능한 형태(`@Transactional` 메서드 안의 `sign` 류 호출 · 반복 상수)로 `convention-check` 항목에 추가하는 것을 검토한다. ArchUnit 등 정적 검사 의존성은 추가 전에 먼저 묻는다.
+- **연결 보유 회귀 테스트**: 작은 풀(H2, 테스트 프로필)에서 보고서를 동시 N 건 호출해 연결 보유 시간 · 활성 연결 수를 단언하는 통합 테스트. 실제 장애와 같은 "작은 풀 + 동시 요청" 조건을 CI 에 둔다.
+- **무거운 작업 격리**: 보고서 동시 실행 수 상한(세마포어 · 전용 스레드 풀)으로 보고서가 몰려도 다른 API 의 연결을 남긴다. 서명은 `payload` 에 대해 결정적이라 결과 캐시도 후보다(캐시 라이브러리는 의존성이라 먼저 묻는다).
+- **상한 강제**: 트랜잭션 타임아웃(`@Transactional(timeout = …)` 또는 `spring.transaction.default-timeout`)으로 "오래 쥐는 코드" 가 풀을 무한히 점유하지 못하게 한다. 값은 정상 보고서 소요 측정 뒤 정한다.
+- **재시도 억제**: 504 후 같은 요청을 1~60초 안에 다시 보내는 클라이언트(53/55건)에 지수 백오프를 적용한다(프런트 저장소 대상).
+
+## 8. 모니터링 항목
+
+경보 시각은 이번 로그를 소급 적용한 값이다. "소급 불가" 는 그 지표의 로그가 없어 시뮬레이션할 수 없다는 뜻이다.
+
+| 지표 | 제안 임계값 | 이번 타임라인에서 울렸을 시각 |
+|---|---|---|
+| Hikari leak WARN 건수 | 5분에 1건 이상(WARN) | **14:37:52** (app:1243) — 사용자 영향보다 약 3분 빠르다 |
+| leak WARN 분당 건수 | 분당 3건 이상(CRITICAL) | 14:39 분 (3건) |
+| 보고서 요청 수 | 분당 8건 이상(평소 ≤1건) | 14:40 분 (10건). 분 집계라 14:40:00~59 사이 |
+| nginx 5xx | 1분에 1건 이상(WARN), 5건 이상(CRITICAL) | WARN 14:40:52(access:18918), CRITICAL 14:41 분(9건) |
+| nginx `upstream timed out` | 1건 이상 | 14:41:06 (error:6) |
+| Hikari 대기 스레드(`pending`) · 활성 연결(`active`/`max`) | pending > 0 이 30초 지속, active ≥ 4/5 가 1분 | **소급 불가** — 풀 상태 로그는 14:40:52 부터만 있다(그때 `waiting` 1~7) |
+| 요청 응답시간 p95 | 5초 초과 | **소급 불가** — nginx access 형식에 응답 시간 필드가 없다 |
+| slow 쿼리 건수 | `long_query_time` 인하 후 분당 N건 | **소급 불가** — 임계값을 모른다 |
+
+## 9. 확인하지 못한 것
+
+| 항목 | 이유 | 다음을 위해 남길 로그 |
+|---|---|---|
+| 보유 시간이 평소 10초 미만에서 15~21초로 늘어난 이유 | 코드상 긴 구간은 서명과 배포별 쿼리인데 소요를 재지 않았다. 동시 요청의 CPU 경쟁 가능성도 미검증 | 보고서 요청별 `조회 ms` · `서명 ms` · `총 ms` 를 남기는 INFO 로그 |
+| `Rows_examined` 128만의 이유 | 인덱스는 스키마에 있다(`01-schema.sql:112`). 운영 DB 의 실행 계획 · 실제 인덱스 · 통계는 없다 | 해당 쿼리의 `EXPLAIN`, 운영 인덱스 목록 |
+| slow 쿼리가 1건뿐인 의미 | `long_query_time` 를 모른다(slow 최소가 2.04초라 ≤2초로 추정만) | `long_query_time` 값, 필요 시 일시적 general log |
+| 14:38 부터 보고서 호출이 늘어난 원인 | 호출 IP 는 평소와 같은 4개 · 브라우저(Firefox/Safari)이고, 자동 새로고침 여부는 로그에 없다 | 프런트(`lms.example.com`)의 호출 로직, 클라이언트 이벤트 로그 |
+| 장애 전 배포 · 설정 변경 여부 | 로그에 재시작 흔적이 없고(`:155`) git 이력은 09-22 에 시작한다 | 09-16 이전 배포 이력, 기동 시 Hikari 설정 출력 |
+| 14:37 이전 풀 사용량 | 풀 상태 로그가 14:40:52 부터다 | `hikaricp_connections_active/pending` 시계열 |
+| 요청별 지연 · 504 의 실제 대기 시간 | nginx access 형식에 `$request_time` 이 없다 | `$request_time` · `$upstream_response_time` 필드 |
+| app ERROR 마지막(14:49:51)과 5xx 마지막(14:51:47)의 간격 | 해석하지 않았다(`:163`). 풀 고갈 대신 nginx 의 upstream 비활성화가 남은 5xx 를 만들었을 가능성이 있으나 미검증 | nginx upstream 상태 변경 로그(`max_fails` · `fail_timeout` 설정) |
+| 알림이 실제로 있었는지 | 로그에 경보 기록이 없다 | 경보 · 호출 이력 |
+
+마스킹 적용: IP 14건(4종 → 교사단말A~D) · 이메일 0건 · 학생 식별자 0건 · 토큰 0건 · 비밀번호/접속 문자열 0건
