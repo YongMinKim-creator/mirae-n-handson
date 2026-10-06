@@ -5,6 +5,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -135,5 +136,22 @@ class ItemControllerTest {
         assertThat(captured.q()).isEqualTo("분수");
         assertThat(captured.page()).isEqualTo("2");
         assertThat(captured.unit()).isNull();
+    }
+
+    @Test
+    @DisplayName("POST /api/items/search → 200, 쿼리 문자열을 GET 과 같게 읽는다(레거시는 메서드를 가리지 않음)")
+    void searchItemsAcceptsPostWithQueryString() throws Exception {
+        when(itemSearchService.search(any(ItemSearchParams.class))).thenReturn(new ItemSearchResponse(
+            List.of(new ItemSearchRow(12, "대분수의 덧셈", "M5-1", 3, List.of("계산"))), 1, null));
+        ArgumentCaptor<ItemSearchParams> params = ArgumentCaptor.forClass(ItemSearchParams.class);
+
+        mockMvc.perform(post("/api/items/search?unit=M5-1&level=3"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.count").value(1))
+            .andExpect(jsonPath("$.rows[0].id").value(12));
+
+        verify(itemSearchService).search(params.capture());
+        assertThat(params.getValue().unit()).isEqualTo("M5-1");
+        assertThat(params.getValue().level()).isEqualTo("3");
     }
 }
